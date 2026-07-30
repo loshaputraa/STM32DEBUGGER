@@ -1,179 +1,143 @@
 # ============================================================================
-# TCP Client - ESP32 Communication Module
+# TCP Client - ESP32 Communication Module (Enhanced for Day 3)
 # ============================================================================
-# Handles all TCP socket communication with ESP32
+# Handles all TCP socket communication with ESP32 + latency tracking
 
-import socket  # Library for TCP/IP network communication
-import threading  # Library for running code in background threads
-import time  # Library for delays and timing functions
-import sys  # System library for flushing output buffer
+import socket
+import threading
+import time
+import sys
+from backend.parser import (
+    parse_packet,
+    record_command_sent,
+    get_next_command_id,
+    get_latest_latency
+)
 
 # ============================================================================
 # CONFIGURATION SECTION
 # ============================================================================
-# Change these values if your ESP32 has a different IP or port
-
-ESP32_IP = "192.168.0.36"  # IP address of your ESP32 (from serial monitor)
-ESP32_PORT = 5000  # Port number the ESP32 server listens on
+ESP32_IP = "192.168.0.36"
+ESP32_PORT = 5000
 
 
 # ============================================================================
-# DebugBridge CLASS - Handles all TCP communication with ESP32
+# DebugBridge CLASS - Handles TCP communication with latency tracking
 # ============================================================================
 
 class DebugBridge:
     """
-    A class that manages the TCP connection to ESP32 and handles sending/
-    receiving data to/from the STM32 microcontroller.
+    TCP client for ESP32/STM32 communication with latency measurement.
 
-    Key Feature: Only displays status changes (STM32 alive/dead), not
-    every single "alive" message to avoid spam.
+    Features:
+    - Connects to ESP32 TCP server
+    - Sends commands and measures round-trip latency
+    - Receives and parses STM32 responses
+    - Provides connection status and latency metrics
     """
 
     def __init__(self):
-        """
-        Constructor - Initialize the DebugBridge when creating a new object.
-        Sets up empty socket and disconnected state.
-        """
-        self.socket = None  # Will hold the TCP socket object
-        self.connected = False  # Flag: True when connected to ESP32
-        self.lock = threading.Lock()  # Lock to prevent print conflicts between threads
-        self.stm32_alive = False  # Track previous STM32 status
+        """Initialize the DebugBridge"""
+        self.socket = None
+        self.connected = False
+        self.lock = threading.Lock()
+        self.stm32_alive = False
+
+        # Latency tracking
+        self.latest_latency_ms = None
+        self.average_latency_ms = None
+        self.command_count = 0
 
     def connect(self):
         """
-        Establish a TCP connection to the ESP32 and start receiving data.
-
-        This method:
-        1. Creates a TCP socket
-        2. Connects to ESP32 at the configured IP and port
-        3. Starts a background thread to listen for incoming messages
-        4. Resets STM32 status tracking
-
-        If connection fails, prints error message and stays disconnected.
+        Establish TCP connection to ESP32 and start receiving.
         """
         try:
-            # Create a TCP socket:
-            # - socket.AF_INET: Use IPv4 (IP address version 4)
-            # - socket.SOCK_STREAM: Use TCP (reliable, connection-oriented)
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-
-            # Try to connect to ESP32
-            # (IP_ADDRESS, PORT) - connects to that server and port
-            # This will wait until connected or timeout occurs
             self.socket.connect((ESP32_IP, ESP32_PORT))
-
-            # If we reach this line, connection was successful
             self.connected = True
-
-            # Reset STM32 status - we haven't heard from it yet
             self.stm32_alive = False
 
-            # Use lock to ensure this print doesn't overlap with other threads
             with self.lock:
                 print(f"\n✓ Connected to ESP32 at {ESP32_IP}:{ESP32_PORT}")
                 print("  Waiting for STM32 status...\n")
 
-            # Create a background thread to receive messages
-            # target=self.receive_data: Run the receive_data method in this thread
-            # daemon=True: Thread exits automatically when main program exits
+            # Start background receiver thread
             receiver_thread = threading.Thread(
                 target=self.receive_data,
                 daemon=True
             )
-
-            # Start the background thread (begins running receive_data)
             receiver_thread.start()
 
-        # If connection fails, catch the exception and print error
         except Exception as e:
             with self.lock:
                 print(f"\n✗ Connection failed: {e}\n")
             self.connected = False
 
     def receive_data(self):
-        """
-        Background thread function - Continuously listen for messages from ESP32.
+        """Background thread - continuously listen for messages"""
+        incomplete_data = ""  # ADD THIS - buffer for incomplete packets
 
-        This runs in a separate thread (not blocking the main program), so it can
-        receive messages while the user is typing commands.
-
-        IMPORTANT: Only shows status changes to avoid spam!
-        - First "STM32 alive" message → displays "✓ STM32: ALIVE"
-        - Later "STM32 alive" messages → ignored (no spam)
-        - Connection lost → displays "✗ STM32: DEAD"
-
-        Process:
-        1. Wait for data to arrive from ESP32
-        2. Decode the data from bytes to text
-        3. Check if status changed (first alive message or connection lost)
-        4. Print only if status changed
-        5. Repeat until connection is lost
-        """
-        # Keep running while connected
         while self.connected:
             try:
-                # Receive up to 1024 bytes of data from ESP32
-                # recv() blocks (waits) until data arrives
-                # The data comes back as bytes, not text
                 raw_data = self.socket.recv(1024)
 
-                # If recv() returns empty bytes, connection is closed
                 if not raw_data:
-                    # Connection was closed by ESP32
                     if self.stm32_alive:
-                        # Status changed from alive to dead - show message
                         with self.lock:
                             print("\n✗ STM32: DEAD (connection lost)")
-                            print("  Type 'reset' to reconnect\n")
-                            sys.stdout.write("Enter command: ")
-                            sys.stdout.flush()
-                        # Update status
                         self.stm32_alive = False
-                    # Stop trying to receive
                     self.connected = False
                     break
 
-                # Convert bytes to text string using UTF-8 encoding
-                # strip() removes extra whitespace (spaces, newlines, tabs)
-                message = raw_data.decode('utf-8').strip()
+                try:
+                    message = raw_data.decode('utf-8', errors='ignore')
+                except UnicodeDecodeError:
+                    continue
 
-                # Only process if we actually received something
-                if message:
-                    # Check if this is a "STM32 alive" message
-                    if "STM32 alive" in message.lower():
-                        # STM32 is sending alive messages
+                # ADD THIS: Combine with incomplete data from previous packet
+                message = incomplete_data + message
+                incomplete_data = ""
 
-                        # Check if this is the FIRST alive message (status change)
+                message = message.replace('\r', '')
+
+                # Split by newlines
+                packets = message.split('\n')
+
+                # Last element might be incomplete - save it for next iteration
+                if packets[-1].strip() != "":
+                    incomplete_data = packets[-1]  # ADD THIS
+                    packets = packets[:-1]  # Process only complete packets
+
+                for packet in packets:
+                    packet = packet.strip()
+                    if not packet:
+                        continue
+
+                    # Validate packet starts correctly
+                    if not (packet.startswith("VAR:") or packet.startswith("EVENT:") or
+                            packet.startswith("CONFIRM:") or "alive" in packet.lower()):
+                        # Skip corrupted packet
+                        continue
+
+                    if "alive" in packet.lower():
                         if not self.stm32_alive:
-                            # First time we heard STM32 is alive - show status
-                            self.stm32_alive = True  # Update status flag
-
-                            # Use lock to prevent overlap with input prompt
+                            self.stm32_alive = True
                             with self.lock:
                                 print("\n✓ STM32: ALIVE")
                                 print("  Ready to send commands\n")
-                                # Re-display the input prompt
                                 sys.stdout.write("Enter command: ")
                                 sys.stdout.flush()
-                        # else: Already showed alive message, don't spam
-
                     else:
-                        # This is a different message (not "STM32 alive")
-                        # Import parser (delayed to avoid circular imports)
-                        from backend.parser import parse_packet
-                        parse_packet(message)
+                        parse_packet(packet)
+                        self.latest_latency_ms = get_latest_latency()
 
-                        # Show in console
                         with self.lock:
-                            print(f"\nSTM32: {message}")
-                            # Re-display input prompt
+                            print(f"\nSTM32: {packet}")
                             sys.stdout.write("Enter command: ")
                             sys.stdout.flush()
 
-            # If anything goes wrong reading data, connection is lost
             except Exception as e:
-                # Set connected flag to False to exit the loop
                 if self.stm32_alive:
                     self.stm32_alive = False
                     with self.lock:
@@ -183,55 +147,70 @@ class DebugBridge:
                         sys.stdout.flush()
                 self.connected = False
                 break
-
     def send_command(self, command):
         """
-        Send a command from the user to the STM32 (through the ESP32).
+        Send command to STM32 and record timing for latency measurement.
 
         Args:
-            command (str): The command text to send to STM32
+            command (str): Command text (e.g., "SET:temperature=25")
 
-        The command is sent as text with a newline character at the end,
-        which is what the ESP32/STM32 expects.
+        Returns:
+            cmd_id: Unique command ID for tracking latency
         """
-        # Check if we're still connected before trying to send
         if self.connected:
             try:
-                # Add newline character '\n' because STM32 reads until newline
-                # .encode('utf-8') converts text to bytes for network transmission
-                # sendall() sends all bytes (unlike send() which might send partial)
+                # Generate unique ID for this command
+                cmd_id = get_next_command_id()
+
+                # Record send time
+                sent_time = time.time()
+                record_command_sent(cmd_id, command, sent_time)
+
+                # Send command with newline
                 message_bytes = (command + '\n').encode('utf-8')
                 self.socket.sendall(message_bytes)
+                self.command_count += 1
 
-                # Use lock and print confirmation
                 with self.lock:
                     print(f"✓ Sent: {command}\n")
 
-            # If sending fails, connection is probably lost
+                return cmd_id
+
             except Exception as e:
                 with self.lock:
                     print(f"✗ Send failed: {e}\n")
                 self.connected = False
+                return None
         else:
-            # User tried to send but we're not connected
             with self.lock:
                 print("✗ Not connected to ESP32\n")
+            return None
 
     def disconnect(self):
-        """
-        Close the connection to ESP32 and clean up resources.
-
-        This should be called when exiting the program to properly
-        close the socket and release network resources.
-        """
-        # Check if socket was created
+        """Close connection and clean up"""
         if self.socket:
             try:
-                # Close the socket (stops all communication)
                 self.socket.close()
             except:
-                pass  # Socket might already be closed, ignore error
+                pass
 
-        # Update connection status
         self.connected = False
         self.stm32_alive = False
+
+    def get_status(self):
+        """
+        Get connection and latency status.
+
+        Returns:
+            dict with keys:
+            - connected: bool
+            - stm32_alive: bool
+            - latest_latency_ms: float or None
+            - command_count: int
+        """
+        return {
+            "connected": self.connected,
+            "stm32_alive": self.stm32_alive,
+            "latest_latency_ms": self.latest_latency_ms,
+            "command_count": self.command_count
+        }
