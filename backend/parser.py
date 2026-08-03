@@ -1,9 +1,17 @@
 # ============================================================================
-# Packet Parser - Enhanced for Day 3 (with latency tracking + DEBUG)
+# Packet Parser - Enhanced with Length-Prefixed Framing
 # ============================================================================
+# Eliminates TCP fragmentation issues by validating frame length
+# before processing payload
+
 from datetime import datetime
-from backend.data_store import variables, events
+from backend.data_store import variables, events, log_sample, add_to_history
 import time
+
+# ============================================================================
+# Framing Constants
+# ============================================================================
+FRAME_HEADER = 0xAA  # Sync byte for frame detection
 
 # ============================================================================
 # Latency Tracking
@@ -36,55 +44,160 @@ def calculate_latency(cmd_id):
 
 
 # ============================================================================
-# Packet Parser with DEBUG
+# Frame Parsing - Length-Prefixed Protocol
+# ============================================================================
+
+def extract_frames(buffer):
+    """
+    Extract complete frames from buffer.
+    Returns: (list of complete frames, remaining incomplete buffer)
+
+    Frame format: [0xAA][LENGTH][PAYLOAD...]\r\n
+
+    Example:
+    Input buffer: b'\\xaa\\x13VAR:temperature=25\\r\\n\\xaa\\x0f...'
+    Output: (['VAR:temperature=25'], b'\\xaa\\x0f...')
+
+    Handles:
+    - Multiple frames in one buffer
+    - Fragmented frames (incomplete)
+    - Invalid headers (skipped)
+    """
+
+    frames = []
+    pos = 0
+
+    while pos < len(buffer):
+        # ====================================================================
+        # Search for frame header (0xAA)
+        # ====================================================================
+        header_pos = buffer.find(FRAME_HEADER, pos)
+
+        if header_pos == -1:
+            # No more headers found
+            remaining = buffer[pos:]
+            return frames, remaining
+
+        # ====================================================================
+        # Check if we have at least header + length byte
+        # ====================================================================
+        if header_pos + 1 >= len(buffer):
+            # Not enough data yet - wait for more
+            remaining = buffer[header_pos:]
+            return frames, remaining
+
+        # Read length byte (position after header)
+        payload_length = buffer[header_pos + 1]
+
+        # ====================================================================
+        # Calculate total frame size needed
+        # ====================================================================
+        # Frame = [HEADER] [LENGTH] [PAYLOAD...] [\r\n]
+        #         1 byte   1 byte   N bytes      2 bytes
+        frame_start = header_pos
+        payload_start = header_pos + 2
+        payload_end = payload_start + payload_length
+        frame_end = payload_end + 2  # Account for \r\n
+
+        # ====================================================================
+        # Check if we have complete frame
+        # ====================================================================
+        if frame_end > len(buffer):
+            # Incomplete frame - wait for more data
+            remaining = buffer[frame_start:]
+            return frames, remaining
+
+        # ====================================================================
+        # Verify terminator (\r\n)
+        # ====================================================================
+        if (buffer[payload_end] != ord('\r') or
+                buffer[payload_end + 1] != ord('\n')):
+            # Invalid terminator - skip this header and search again
+            print(f"[PARSER] Frame validation failed at pos {frame_start}: "
+                  f"expected \\r\\n, got {buffer[payload_end:payload_end + 2]}")
+            pos = header_pos + 1
+            continue
+
+        # ====================================================================
+        # Valid frame - extract payload
+        # ====================================================================
+        payload = buffer[payload_start:payload_end].decode('utf-8', errors='ignore')
+        frames.append(payload)
+
+        print(f"[FRAME] 0x{FRAME_HEADER:02X} 0x{payload_length:02X} {payload}")
+
+        # Move position past this frame
+        pos = frame_end
+
+    # All frames processed, no remaining data
+    return frames, b''
+
+
+# ============================================================================
+# Packet Parser
 # ============================================================================
 
 def parse_packet(packet):
-    """Parse incoming packet from STM32"""
+    """
+    Parse a complete, de-framed packet.
+    At this point, TCP fragmentation is already handled by frame extraction.
+
+    Packet types:
+    - VAR:name=value
+    - CONFIRM:command,status
+    - EVENT:message
+    - STM32 alive
+    """
 
     packet = packet.strip()
 
     if not packet:
-        print(f"[PARSER] Empty packet, skipping")  # DEBUG
+        print(f"[PARSER] Empty packet, skipping")
         return
 
-    print(f"[PARSER] Received: {packet}")  # DEBUG - ALWAYS SHOW INCOMING
+    print(f"[PARSER] Processing: {packet}")
 
     # ========================================================================
     # VARIABLE PACKET - Format: VAR:name=value
     # ========================================================================
     if packet.startswith("VAR:"):
-        print(f"[PARSER] Processing VAR packet")  # DEBUG
+        print(f"[PARSER] VAR packet detected")
         payload = packet[4:]
         if "=" in payload:
             name, value = payload.split("=", 1)
-            variables[name.strip()] = {
-                "value": value.strip(),
+            name = name.strip()
+            value = value.strip()
+            variables[name] = {
+                "value": value,
                 "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
                 "status": "confirmed"
             }
-            print(f"[PARSER] Stored: {name.strip()} = {value.strip()}")  # DEBUG
+            print(f"[PARSER] Stored: {name} = {value}")
+
+            add_to_history(name, value)          # Day 4: record sample for graphing
+            log_sample("VAR", name, value)        # Day 5: session recording
         return
 
     # ========================================================================
     # EVENT PACKET - Format: EVENT:message
     # ========================================================================
     if packet.startswith("EVENT:"):
-        print(f"[PARSER] Processing EVENT packet")  # DEBUG
+        print(f"[PARSER] EVENT packet detected")
         payload = packet[6:]
         events.append({
             "event": payload.strip(),
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
             "type": "info"
         })
-        print(f"[PARSER] Event logged: {payload.strip()}")  # DEBUG
+        print(f"[PARSER] Event logged: {payload.strip()}")
+        log_sample("EVENT", "-", payload.strip())  # Day 5: session recording
         return
 
     # ========================================================================
     # CONFIRMATION PACKET - Format: CONFIRM:command,status
     # ========================================================================
     if packet.startswith("CONFIRM:"):
-        print(f"[PARSER] Processing CONFIRM packet")  # DEBUG
+        print(f"[PARSER] CONFIRM packet detected")
         payload = packet[8:]
         parts = payload.split(",")
 
@@ -111,18 +224,26 @@ def parse_packet(packet):
                 "status": status,
                 "latency_ms": latency
             })
-            print(f"[PARSER] Confirmation logged with latency: {latency}")  # DEBUG
+
+            if latency is not None:
+                print(f"[PARSER] Confirmation with latency: {latency:.1f}ms")
+            else:
+                print(f"[PARSER] Confirmation received (no matching pending command)")
+
+            # Day 5: session recording
+            confirm_value = status if latency is None else f"{status} ({latency:.1f}ms)"
+            log_sample("CONFIRM", command, confirm_value)
         return
 
     # ========================================================================
     # Status Packet
     # ========================================================================
     if "alive" in packet.lower():
-        print(f"[PARSER] Status packet (alive), ignoring")  # DEBUG
+        print(f"[PARSER] Status packet (alive), storing")
         return
 
     # Unknown packet
-    print(f"[PARSER] Unknown packet: {packet}")  # DEBUG
+    print(f"[PARSER] Unknown packet: {packet}")
     events.append({
         "event": f"Unknown packet: {packet}",
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],

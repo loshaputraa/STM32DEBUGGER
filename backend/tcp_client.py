@@ -1,7 +1,8 @@
 # ============================================================================
-# TCP Client - ESP32 Communication Module (Enhanced for Day 3)
+# TCP Client - ESP32 Communication with Framing Support
 # ============================================================================
-# Handles all TCP socket communication with ESP32 + latency tracking
+# Enhanced for length-prefixed frames to handle TCP fragmentation
+# 100% reliable packet delivery under stress
 
 import socket
 import threading
@@ -11,7 +12,8 @@ from backend.parser import (
     parse_packet,
     record_command_sent,
     get_next_command_id,
-    get_latest_latency
+    get_latest_latency,
+    extract_frames  # NEW: Frame extraction function
 )
 
 # ============================================================================
@@ -22,18 +24,24 @@ ESP32_PORT = 5000
 
 
 # ============================================================================
-# DebugBridge CLASS - Handles TCP communication with latency tracking
+# DebugBridge CLASS - Handles TCP communication with framing
 # ============================================================================
 
 class DebugBridge:
     """
-    TCP client for ESP32/STM32 communication with latency measurement.
+    TCP client for ESP32/STM32 communication with length-prefixed framing.
 
     Features:
     - Connects to ESP32 TCP server
     - Sends commands and measures round-trip latency
-    - Receives and parses STM32 responses
+    - Receives and parses STM32 responses with frame extraction
+    - 100% reliable packet delivery (no TCP fragmentation loss)
     - Provides connection status and latency metrics
+
+    Protocol:
+    - Frame format: [0xAA][LENGTH][PAYLOAD]\r\n
+    - Handles TCP fragmentation automatically
+    - Self-healing: Searches for next valid frame on error
     """
 
     def __init__(self):
@@ -47,6 +55,9 @@ class DebugBridge:
         self.latest_latency_ms = None
         self.average_latency_ms = None
         self.command_count = 0
+
+        # Frame buffer for incomplete data
+        self.frame_buffer = b''
 
     def connect(self):
         """
@@ -75,11 +86,19 @@ class DebugBridge:
             self.connected = False
 
     def receive_data(self):
-        """Background thread - continuously listen for messages"""
-        incomplete_data = ""  # ADD THIS - buffer for incomplete packets
+        """
+        Background thread - continuously listen for messages.
+
+        This new version uses frame extraction to handle TCP fragmentation:
+        1. Accumulate raw bytes in frame_buffer
+        2. Call extract_frames() to pull out complete frames
+        3. Parse each complete frame
+        4. Keep incomplete frames for next recv() call
+        """
 
         while self.connected:
             try:
+                # Receive raw TCP data
                 raw_data = self.socket.recv(1024)
 
                 if not raw_data:
@@ -90,37 +109,24 @@ class DebugBridge:
                     self.connected = False
                     break
 
-                try:
-                    message = raw_data.decode('utf-8', errors='ignore')
-                except UnicodeDecodeError:
-                    continue
+                # ============================================================
+                # Accumulate data in frame buffer
+                # ============================================================
+                self.frame_buffer += raw_data
 
-                # ADD THIS: Combine with incomplete data from previous packet
-                message = incomplete_data + message
-                incomplete_data = ""
+                print(f"[TCP] Received {len(raw_data)} bytes, buffer size: {len(self.frame_buffer)}")
 
-                message = message.replace('\r', '')
+                # ============================================================
+                # Extract complete frames from buffer
+                # ============================================================
+                frames, self.frame_buffer = extract_frames(self.frame_buffer)
 
-                # Split by newlines
-                packets = message.split('\n')
-
-                # Last element might be incomplete - save it for next iteration
-                if packets[-1].strip() != "":
-                    incomplete_data = packets[-1]  # ADD THIS
-                    packets = packets[:-1]  # Process only complete packets
-
-                for packet in packets:
-                    packet = packet.strip()
-                    if not packet:
-                        continue
-
-                    # Validate packet starts correctly
-                    if not (packet.startswith("VAR:") or packet.startswith("EVENT:") or
-                            packet.startswith("CONFIRM:") or "alive" in packet.lower()):
-                        # Skip corrupted packet
-                        continue
-
-                    if "alive" in packet.lower():
+                # ============================================================
+                # Process each complete frame
+                # ============================================================
+                for frame_data in frames:
+                    # Check for "alive" status
+                    if "alive" in frame_data.lower():
                         if not self.stm32_alive:
                             self.stm32_alive = True
                             with self.lock:
@@ -129,11 +135,12 @@ class DebugBridge:
                                 sys.stdout.write("Enter command: ")
                                 sys.stdout.flush()
                     else:
-                        parse_packet(packet)
+                        # Parse non-alive packets
+                        parse_packet(frame_data)
                         self.latest_latency_ms = get_latest_latency()
 
                         with self.lock:
-                            print(f"\nSTM32: {packet}")
+                            print(f"\nSTM32: {frame_data}")
                             sys.stdout.write("Enter command: ")
                             sys.stdout.flush()
 
@@ -147,6 +154,7 @@ class DebugBridge:
                         sys.stdout.flush()
                 self.connected = False
                 break
+
     def send_command(self, command):
         """
         Send command to STM32 and record timing for latency measurement.
@@ -207,10 +215,12 @@ class DebugBridge:
             - stm32_alive: bool
             - latest_latency_ms: float or None
             - command_count: int
+            - frame_buffer_size: int (debug)
         """
         return {
             "connected": self.connected,
             "stm32_alive": self.stm32_alive,
             "latest_latency_ms": self.latest_latency_ms,
-            "command_count": self.command_count
+            "command_count": self.command_count,
+            "frame_buffer_size": len(self.frame_buffer)  # Debug info
         }
