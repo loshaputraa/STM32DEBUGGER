@@ -17,6 +17,91 @@ variables = {}
 events = []
 
 # ============================================================================
+# LIST SNAPSHOT TRACKING - authoritative "what variables actually exist
+# on the device right now" (used by the Variable Table's Refresh button)
+# ============================================================================
+# VAR: packets are pure upserts - nothing ever deleted a variable from
+# `variables`, so a variable removed from a re-flashed firmware (or one
+# that simply stopped being sent) lingered forever. LIST is the one
+# request where the device tells us its FULL current set: every VAR: it
+# sends between LIST being issued and the matching CONFIRM:LIST is the
+# complete, authoritative list. Anything already in `variables` that
+# ISN'T reported in that window no longer exists on the device and
+# should be dropped.
+_list_in_progress = False
+_list_seen_names = set()
+
+
+def start_list_snapshot():
+    """Call right before sending the LIST command."""
+    global _list_in_progress, _list_seen_names
+    _list_in_progress = True
+    _list_seen_names = set()
+    print(f"[DEBUG:data_store] start_list_snapshot() - known before LIST: {sorted(variables.keys())}")
+    events.append({
+        "event": f"[DEBUG] LIST snapshot started. Variables known before LIST: {sorted(variables.keys())}",
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
+        "type": "debug"
+    })
+
+
+def note_list_variable(name):
+    """Call for every VAR: packet as it's parsed. No-op unless a LIST
+    snapshot is currently in progress."""
+    if _list_in_progress:
+        _list_seen_names.add(name)
+        print(f"[DEBUG:data_store] note_list_variable('{name}') - seen so far: {sorted(_list_seen_names)}")
+
+
+def is_list_in_progress():
+    """True while a LIST request is awaiting its CONFIRM:LIST reply."""
+    return _list_in_progress
+
+
+def abort_list_snapshot():
+    """Give up on the current snapshot (e.g. after a client-side timeout)
+    without pruning anything - we don't know what the device's real state
+    is if it never confirmed, so it's safer to leave `variables` untouched
+    than to guess."""
+    global _list_in_progress
+    _list_in_progress = False
+
+
+def finish_list_snapshot():
+    """Call when CONFIRM:LIST is received. Removes any variable (and its
+    graph history) that wasn't part of this LIST response.
+    Returns the set of variable names that were removed."""
+    global _list_in_progress
+    if not _list_in_progress:
+        # This fires if CONFIRM:LIST arrived without a matching
+        # start_list_snapshot() - e.g. Refresh wasn't clicked, or the LIST
+        # command came from somewhere else. No pruning happens in this case.
+        print("[DEBUG:data_store] finish_list_snapshot() called but no snapshot was in progress - skipping prune")
+        events.append({
+            "event": "[DEBUG] CONFIRM:LIST received but no snapshot was in progress - nothing pruned. "
+                     "(Was Refresh actually clicked, and was start_list_snapshot() called before LIST was sent?)",
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
+            "type": "debug"
+        })
+        return set()
+
+    stale = set(variables.keys()) - _list_seen_names
+    print(f"[DEBUG:data_store] finish_list_snapshot() - device reported: {sorted(_list_seen_names)} | "
+          f"stale (removing): {sorted(stale)}")
+    events.append({
+        "event": f"[DEBUG] LIST finished. Device reported: {sorted(_list_seen_names)} | "
+                 f"Removing stale: {sorted(stale) if stale else 'none'}",
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
+        "type": "debug"
+    })
+    for name in stale:
+        variables.pop(name, None)
+        history.pop(name, None)
+
+    _list_in_progress = False
+    return stale
+
+# ============================================================================
 # ROLLING HISTORY - Time-series data for graphing (Day 4)
 # ============================================================================
 # Maintains 1200 samples @ 50ms = 60 seconds of history per variable
